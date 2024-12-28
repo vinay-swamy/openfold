@@ -77,39 +77,39 @@ extra_cuda_flags += cc_flag
 
 cc_flag = ['-gencode', 'arch=compute_70,code=sm_70']
 
-if bare_metal_major != -1:
-    modules = [CUDAExtension(
-        name="attn_core_inplace_cuda",
-        sources=[
-            "openfold/utils/kernel/csrc/softmax_cuda.cpp",
-            "openfold/utils/kernel/csrc/softmax_cuda_kernel.cu",
-        ],
-        include_dirs=[
-            os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                'openfold/utils/kernel/csrc/'
-            )
-        ],
-        extra_compile_args={
-            'cxx': ['-O3'] + version_dependent_macros,
-            'nvcc': (
-                ['-O3', '--use_fast_math'] +
-                version_dependent_macros +
-                extra_cuda_flags
-            ),
-        }
-    )]
-else:
-    modules = [CppExtension(
-        name="attn_core_inplace_cuda",
-        sources=[
-            "openfold/utils/kernel/csrc/softmax_cuda.cpp",
-            "openfold/utils/kernel/csrc/softmax_cuda_stub.cpp",
-        ],
-        extra_compile_args={
-            'cxx': ['-O3'],
-        }
-    )]
+# if bare_metal_major != -1:
+#     modules = [CUDAExtension(
+#         name="attn_core_inplace_cuda",
+#         sources=[
+#             "openfold/utils/kernel/csrc/softmax_cuda.cpp",
+#             "openfold/utils/kernel/csrc/softmax_cuda_kernel.cu",
+#         ],
+#         include_dirs=[
+#             os.path.join(
+#                 os.path.dirname(os.path.abspath(__file__)),
+#                 'openfold/utils/kernel/csrc/'
+#             )
+#         ],
+#         extra_compile_args={
+#             'cxx': ['-O3'] + version_dependent_macros,
+#             'nvcc': (
+#                 ['-O3', '--use_fast_math'] +
+#                 version_dependent_macros +
+#                 extra_cuda_flags
+#             ),
+#         }
+#     )]
+# else:
+#     modules = [CppExtension(
+#         name="attn_core_inplace_cuda",
+#         sources=[
+#             "openfold/utils/kernel/csrc/softmax_cuda.cpp",
+#             "openfold/utils/kernel/csrc/softmax_cuda_stub.cpp",
+#         ],
+#         extra_compile_args={
+#             'cxx': ['-O3'],
+#         }
+#     )]
 
 setup(
     name='openfold',
@@ -125,7 +125,7 @@ setup(
         "openfold": ['utils/kernel/csrc/*'],
         "": ["resources/stereo_chemical_props.txt"]
     },
-    ext_modules=modules,
+    #ext_modules=modules,
     cmdclass={'build_ext': BuildExtension},
     classifiers=[
         'License :: OSI Approved :: Apache Software License',

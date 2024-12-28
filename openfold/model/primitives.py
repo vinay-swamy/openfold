@@ -513,34 +513,34 @@ class Attention(nn.Module):
 
         if is_fp16_enabled():
             use_memory_efficient_kernel = False
-        
-        if use_memory_efficient_kernel:
-            if len(biases) > 2:
-                raise ValueError(
-                    "If use_memory_efficient_kernel is True, you may only "
-                    "provide up to two bias terms"
-                )
-            o = attention_core(q, k, v, *((biases + [None] * 2)[:2]))
-            o = o.transpose(-2, -3)
-        elif use_deepspeed_evo_attention:
-            if len(biases) > 2:
-                raise ValueError(
-                    "If use_deepspeed_evo_attention is True, you may only "
-                    "provide up to two bias terms"
-                )
-            o = _deepspeed_evo_attn(q, k, v, biases)
-        elif use_lma:
-            biases = [
-                b.expand(b.shape[:-2] + (q_x.shape[-2],) + (kv_x.shape[-2],)) 
-                for b in biases
-            ]
-            o = _lma(q, k, v, biases, lma_q_chunk_size, lma_kv_chunk_size)
-            o = o.transpose(-2, -3)
-        elif use_flash:
-            o = _flash_attn(q, k, v, flash_mask)
-        else:
-            o = _attention(q, k, v, biases)
-            o = o.transpose(-2, -3)
+        ## VS: hard coding this out 
+        # if use_memory_efficient_kernel:
+        #     if len(biases) > 2:
+        #         raise ValueError(
+        #             "If use_memory_efficient_kernel is True, you may only "
+        #             "provide up to two bias terms"
+        #         )
+        #     o = attention_core(q, k, v, *((biases + [None] * 2)[:2]))
+        #     o = o.transpose(-2, -3)
+        # elif use_deepspeed_evo_attention:
+        #     if len(biases) > 2:
+        #         raise ValueError(
+        #             "If use_deepspeed_evo_attention is True, you may only "
+        #             "provide up to two bias terms"
+        #         )
+        #     o = _deepspeed_evo_attn(q, k, v, biases)
+        # elif use_lma:
+        #     biases = [
+        #         b.expand(b.shape[:-2] + (q_x.shape[-2],) + (kv_x.shape[-2],)) 
+        #         for b in biases
+        #     ]
+        #     o = _lma(q, k, v, biases, lma_q_chunk_size, lma_kv_chunk_size)
+        #     o = o.transpose(-2, -3)
+        # elif use_flash:
+        #     o = _flash_attn(q, k, v, flash_mask)
+        # else:
+        o = _attention(q, k, v, biases)
+        o = o.transpose(-2, -3)
 
         o = self._wrap_up(o, q_x)
 

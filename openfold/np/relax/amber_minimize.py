@@ -33,7 +33,8 @@ from openmm import unit
 from openmm import app as openmm_app
 from openmm.app.internal.pdbstructure import PdbStructure
 
-ENERGY = unit.kilocalories_per_mole
+#ENERGY = unit.kilocalories_per_mole
+ENERGY = unit.kilojoule_per_mole
 LENGTH = unit.angstroms
 
 
@@ -93,11 +94,11 @@ def _openmm_minimize(
     force_field = openmm_app.ForceField("amber99sb.xml")
     constraints = openmm_app.HBonds
     system = force_field.createSystem(pdb.topology, constraints=constraints)
-    if stiffness > 0 * ENERGY / (LENGTH ** 2):
+    if stiffness > 0 * ENERGY *4.184 / (LENGTH ** 2):
         _add_restraints(system, pdb, stiffness, restraint_set, exclude_residues)
 
     integrator = openmm.LangevinIntegrator(0, 0.01, 0.0)
-    platform = openmm.Platform.getPlatformByName("CUDA" if use_gpu else "CPU")
+    platform = openmm.Platform.getPlatformByName("HIP" if use_gpu else "CPU")
     simulation = openmm_app.Simulation(
         pdb.topology, system, integrator, platform
     )
@@ -105,11 +106,11 @@ def _openmm_minimize(
 
     ret = {}
     state = simulation.context.getState(getEnergy=True, getPositions=True)
-    ret["einit"] = state.getPotentialEnergy().value_in_unit(ENERGY)
+    ret["einit"] = state.getPotentialEnergy().value_in_unit(ENERGY) * 4.184
     ret["posinit"] = state.getPositions(asNumpy=True).value_in_unit(LENGTH)
     simulation.minimizeEnergy(maxIterations=max_iterations, tolerance=tolerance)
     state = simulation.context.getState(getEnergy=True, getPositions=True)
-    ret["efinal"] = state.getPotentialEnergy().value_in_unit(ENERGY)
+    ret["efinal"] = state.getPotentialEnergy().value_in_unit(ENERGY) * 4.184
     ret["pos"] = state.getPositions(asNumpy=True).value_in_unit(LENGTH)
     ret["min_pdb"] = _get_pdb_string(simulation.topology, state.getPositions())
     return ret
@@ -439,8 +440,8 @@ def _run_one_iteration(
     exclude_residues = exclude_residues or []
 
     # Assign physical dimensions.
-    tolerance = tolerance * ENERGY
-    stiffness = stiffness * ENERGY / (LENGTH ** 2)
+    tolerance = tolerance * ENERGY * 4.184
+    stiffness = stiffness * ENERGY * 4.184 / (LENGTH ** 2)
 
     start = time.perf_counter()
     minimized = False
