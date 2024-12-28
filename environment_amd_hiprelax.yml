@@ -1,0 +1,31 @@
+name: openfold-env 
+channels:
+  - conda-forge
+  - bioconda
+  - pytorch
+dependencies:
+  - python=3.10
+  - pip
+  - pdbfixer
+  - biopython
+  - numpy
+  - pandas
+  - PyYAML==5.4.1
+  - requests
+  - scipy
+  - tqdm==4.62.2
+  - typing-extensions==4.0
+  - wandb
+  - modelcif==0.7
+  - awscli
+  - ml-collections
+  - aria2
+  - mkl=2024.0
+  - git
+  - bioconda::hmmer==3.3.2
+  - bioconda::hhsuite==3.3.0
+  - bioconda::kalign2==2.04
+  - bioconda::mmseqs2
+  - pip:
+      - dm-tree==0.1.6
+      - boto3
