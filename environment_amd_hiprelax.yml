@@ -26,6 +26,7 @@ dependencies:
   - bioconda::hhsuite==3.3.0
   - bioconda::kalign2==2.04
   - bioconda::mmseqs2
+  - bioconda::seqkit
   - pip:
       - dm-tree==0.1.6
       - boto3
