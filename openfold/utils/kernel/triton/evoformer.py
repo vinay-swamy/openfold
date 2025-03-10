@@ -1,0 +1,1130 @@
+import torch
+import triton
+import triton.language as tl
+from deepspeed.utils.timer import SynchronizedWallClockTimer
+
+
+def is_hip():
+    """Check if the current backend is HIP."""
+    return triton.runtime.driver.active.get_current_target().backend == "hip"
+
+
+@triton.jit
+def get_neg_max_value(dtype: tl.dtype):
+    """Get the negative maximum value for a given dtype."""
+    if dtype == tl.float32:
+        return -3.4028234663852886e38
+    if dtype == tl.float16:
+        return -65504.0
+    if dtype == tl.bfloat16:
+        return -3.3895313892515355e38
+
+
+@triton.jit
+def _attn_fwd_inner(
+    O_block,
+    l_i,
+    m_i,
+    Q_block,
+    K_block_ptr,
+    V_block_ptr,
+    res_mask_block_ptr,
+    pair_bias_block_ptr,
+    block_index_q,
+    DIM,
+    stride_K_seq,
+    stride_V_seq,
+    stride_mask_seq,
+    stride_pair_bias_seq2,
+    softmax_scale,
+    EVEN_Q: tl.constexpr,
+    EVEN_KV: tl.constexpr,
+    EVEN_DIM: tl.constexpr,
+    BLOCK_SIZE_Q: tl.constexpr,
+    BLOCK_SIZE_KV: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+    offs_q: tl.constexpr,
+    offs_kv: tl.constexpr,
+    offs_d: tl.constexpr,
+    SEQ_LEN: tl.constexpr,
+):
+    """Run the inner loop of the forward pass of the attention mechanism."""
+    lo, hi = 0, SEQ_LEN
+    Q_block = Q_block * tl.full((1,), softmax_scale, dtype=Q_block.dtype)
+
+    # loop over k, v and update accumulator
+    for start_kv in range(lo, hi, BLOCK_SIZE_KV):
+        # Just let the compiler know that start_n is a multiple of BLOCK_N, so the compiler can do optimizations
+        start_kv = tl.multiple_of(start_kv, BLOCK_SIZE_KV)
+
+        # -- compute qk ----
+        if EVEN_Q & EVEN_KV:
+            pair_bias_block = tl.load(pair_bias_block_ptr)
+            res_mask_block = tl.load(res_mask_block_ptr).broadcast_to(
+                (BLOCK_SIZE_Q, BLOCK_SIZE_KV)
+            )
+            if EVEN_DIM:
+                K_block = tl.load(K_block_ptr)
+                V_block = tl.load(V_block_ptr)
+            else:
+                K_block = tl.load(K_block_ptr, mask=offs_d[:, None] < DIM, other=0.0)
+                V_block = tl.load(V_block_ptr, mask=offs_d[None, :] < DIM, other=0.0)
+        else:
+            pair_bias_block = tl.load(
+                pair_bias_block_ptr,
+                mask=(offs_q[:, None] < SEQ_LEN) & ((start_kv + offs_kv)[None, :] < SEQ_LEN),
+                other=0.0,
+            )
+            res_mask_block = tl.load(
+                res_mask_block_ptr,
+                mask=(start_kv + offs_kv)[None, :] < SEQ_LEN,
+                other=False,
+            ).broadcast_to((BLOCK_SIZE_Q, BLOCK_SIZE_KV))
+            if EVEN_DIM:
+                K_block = tl.load(
+                    K_block_ptr, mask=(start_kv + offs_kv)[None, :] < SEQ_LEN, other=0.0
+                )
+                V_block = tl.load(
+                    V_block_ptr, mask=(start_kv + offs_kv)[:, None] < SEQ_LEN, other=0.0
+                )
+            else:
+                K_block = tl.load(
+                    K_block_ptr,
+                    mask=((start_kv + offs_kv)[None, :] < SEQ_LEN) & (offs_d[:, None] < DIM),
+                    other=0.0,
+                )
+                V_block = tl.load(
+                    V_block_ptr,
+                    mask=((start_kv + offs_kv)[:, None] < SEQ_LEN) & (offs_d[None, :] < DIM),
+                    other=0.0,
+                )
+
+        QK_block = tl.dot(Q_block, K_block) + pair_bias_block
+        QK_block = tl.where(res_mask_block, QK_block, get_neg_max_value(QK_block.dtype))
+
+        m_ij = tl.maximum(m_i, tl.max(QK_block, 1))
+        QK_block = QK_block - m_ij[:, None]
+
+        # Compute the exponential of each dot product, so now we are computing exp(qk_ij - m_ij)
+        P_block = tl.math.exp(QK_block)
+        # Compute the sum by rows of the attention scores
+        l_ij = tl.sum(P_block, 1)
+
+        # This is the correction factor for the previous l_i
+        alpha = tl.math.exp(m_i - m_ij)
+        # Apply the correction factor to the previous l_i and add the new l_ij
+        l_i = l_i * alpha + l_ij
+
+        P_block = P_block.to(V_block.dtype)
+        # This computes the following: O_new = P x V + O_old * alpha
+        O_block = O_block * alpha[:, None]
+        O_block = tl.dot(P_block, V_block, O_block)
+
+        m_i = m_ij
+
+        # Move to the next block of K and V
+        # V_block_ptr = tl.advance(V_block_ptr, (BLOCK_SIZE_KV, 0))
+        V_block_ptr += BLOCK_SIZE_KV * stride_V_seq
+        # K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_SIZE_KV))
+        K_block_ptr += BLOCK_SIZE_KV * stride_K_seq
+        # pair_bias_block_ptr = tl.advance(pair_bias_block_ptr, (0, BLOCK_SIZE_KV))
+        pair_bias_block_ptr += BLOCK_SIZE_KV * stride_pair_bias_seq2
+        res_mask_block_ptr += BLOCK_SIZE_KV * stride_mask_seq
+
+    return O_block, l_i, m_i
+
+
+# @triton.autotune(
+#     [
+#         triton.Config(
+#             {"BLOCK_SIZE_Q": BLOCK_SIZE_Q, "BLOCK_SIZE_KV": BLOCK_SIZE_KV},
+#             num_stages=num_stages,
+#             num_warps=num_warps,
+#         )
+#         for BLOCK_SIZE_Q in [16, 32, 64]
+#         for BLOCK_SIZE_KV in [16, 32, 64]
+#         for num_stages in ([1, 3, 4, 7])
+#         for num_warps in [4, 8]
+#     ],
+#     key=["SEQ_LEN", "DIM"],
+# )
+@triton.heuristics(
+    {
+        "EVEN_Q": lambda args: args["SEQ_LEN"] % args["BLOCK_SIZE_Q"] == 0,
+        "EVEN_KV": lambda args: args["SEQ_LEN"] % args["BLOCK_SIZE_KV"] == 0,
+        "EVEN_DIM": lambda args: args["DIM"] == args["BLOCK_DIM"],
+    }
+)
+@triton.jit
+def _attn_fwd(
+    Q,  # BATCH_SIZE, HEAD, N_SEQ, SEQ_LEN, DIM
+    K,  # BATCH_SIZE, HEAD, N_SEQ, SEQ_LEN, DIM
+    V,  # BATCH_SIZE, HEAD, N_SEQ, SEQ_LEN, DIM
+    res_mask,  # BATCH_SIZE, 1, N_SEQ, SEQ_LEN, 1
+    pair_bias,  # BATCH_SIZE, HEAD, 1, SEQ_LEN, SEQ_LEN
+    softmax_scale,
+    M,  # BATCH_SIZE, HEAD, N_SEQ, SEQ_LEN
+    O,  # BATCH_SIZE, HEAD, N_SEQ, SEQ_LEN, DIM
+    stride_Q_batch,
+    stride_Q_head,
+    stride_Q_msa,
+    stride_Q_seq,
+    stride_Q_dim,
+    stride_K_batch,
+    stride_K_head,
+    stride_K_msa,
+    stride_K_seq,
+    stride_K_dim,
+    stride_V_batch,
+    stride_V_head,
+    stride_V_msa,
+    stride_V_seq,
+    stride_V_dim,
+    stride_O_batch,
+    stride_O_head,
+    stride_O_msa,
+    stride_O_seq,
+    stride_O_dim,
+    stride_pair_bias_batch,
+    stride_pair_bias_head,
+    stride_pair_bias_seq1,
+    stride_pair_bias_seq2,
+    stride_mask_batch,
+    stride_mask_msa,
+    stride_mask_seq,
+    BATCH_SIZE,
+    HEAD: tl.constexpr,
+    N_SEQ: tl.constexpr,
+    SEQ_LEN: tl.constexpr,
+    DIM: tl.constexpr,
+    EVEN_Q: tl.constexpr,
+    EVEN_KV: tl.constexpr,
+    EVEN_DIM: tl.constexpr,
+    BLOCK_SIZE_Q: tl.constexpr,
+    BLOCK_SIZE_KV: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+):
+    """Run the forward pass of the attention mechanism."""
+    block_index_q = tl.program_id(0)
+
+    index_batch_head_msa = tl.program_id(1)
+    index_batch_head = index_batch_head_msa // N_SEQ
+    index_msa = index_batch_head_msa % N_SEQ
+    index_batch = index_batch_head // HEAD
+    index_head = index_batch_head % HEAD
+
+    qvk_offset = (
+        index_batch * stride_Q_batch + index_head * stride_Q_head + index_msa * stride_Q_msa
+    )
+    offs_q = block_index_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+    offs_kv = tl.arange(0, BLOCK_SIZE_KV)
+    offs_d = tl.arange(0, BLOCK_DIM)
+
+    Q_block_ptr = Q + qvk_offset + (offs_q[:, None] * stride_Q_seq + offs_d[None, :])
+    V_block_ptr = V + qvk_offset + (offs_kv[:, None] * stride_V_seq + offs_d[None, :])
+    K_block_ptr = K + qvk_offset + (offs_kv[None, :] * stride_K_seq + offs_d[:, None])
+    pair_bias_block_ptr = (
+        pair_bias
+        + index_batch * stride_pair_bias_batch
+        + index_head * stride_pair_bias_head
+        + (offs_q[:, None] * stride_pair_bias_seq1 + offs_kv[None, :] * stride_pair_bias_seq2)
+    )
+    O_block_ptr = O + qvk_offset + (offs_q[:, None] * stride_O_seq + offs_d[None, :])
+
+    res_mask_block_ptr = (
+        res_mask
+        + (index_batch * stride_mask_batch + index_msa * stride_mask_msa)
+        + (offs_kv[None, :] * stride_mask_seq)
+    )
+
+    # m_i: the running maximum. We have one for each query
+    m_i = tl.zeros([BLOCK_SIZE_Q], dtype=tl.float32) - float("inf")
+    # l_i: the running sum. We have one for each query (as we sum the attention scores by rows)
+    l_i = tl.zeros([BLOCK_SIZE_Q], dtype=tl.float32) + 1.0
+    # acc: the accumulator for the output, which is a group of rows of the O matrix
+    O_block = tl.zeros([BLOCK_SIZE_Q, BLOCK_DIM], dtype=tl.float32)
+
+    # load the blocks of Q: it will stay in SRAM throughout
+    if EVEN_Q & EVEN_KV:
+        if EVEN_DIM:
+            Q_block = tl.load(Q_block_ptr)
+        else:
+            Q_block = tl.load(Q_block_ptr, mask=offs_d[None, :] < DIM, other=0.0)
+    else:
+        if EVEN_DIM:
+            Q_block = tl.load(Q_block_ptr, mask=offs_q[:, None] < SEQ_LEN, other=0.0)
+        else:
+            Q_block = tl.load(
+                Q_block_ptr,
+                mask=(offs_q[:, None] < SEQ_LEN) & (offs_d[None, :] < DIM),
+                other=0.0,
+            )
+
+    O_block, l_i, m_i = _attn_fwd_inner(
+        O_block,
+        l_i,
+        m_i,
+        Q_block,
+        K_block_ptr,
+        V_block_ptr,
+        res_mask_block_ptr,
+        pair_bias_block_ptr,
+        block_index_q,
+        DIM,
+        stride_K_seq,
+        stride_V_seq,
+        stride_mask_seq,
+        stride_pair_bias_seq2,
+        softmax_scale,
+        EVEN_Q,
+        EVEN_KV,
+        EVEN_DIM,
+        BLOCK_SIZE_Q,
+        BLOCK_SIZE_KV,
+        BLOCK_DIM,
+        offs_q,
+        offs_kv,
+        offs_d,
+        SEQ_LEN,
+    )
+
+    m_i += tl.math.log(l_i)
+    O_block = O_block / l_i[:, None]
+    O_block = O_block.to(O.type.element_ty)
+    m_ptrs = M + index_batch_head_msa * SEQ_LEN + offs_q
+
+    if EVEN_Q:
+        tl.store(m_ptrs, m_i)
+        if EVEN_DIM:
+            tl.store(O_block_ptr, O_block)
+        else:
+            tl.store(O_block_ptr, O_block, mask=offs_d[None, :] < DIM)
+    else:
+        tl.store(m_ptrs, m_i, mask=offs_q < SEQ_LEN)
+        if EVEN_DIM:
+            tl.store(O_block_ptr, O_block, mask=offs_q[:, None] < SEQ_LEN)
+        else:
+            tl.store(
+                O_block_ptr,
+                O_block,
+                mask=(offs_q[:, None] < SEQ_LEN) & (offs_d[None, :] < DIM),
+            )
+
+
+# @triton.autotune(
+#     [triton.Config({"BLOCK_SIZE_Q": BLOCK_SIZE_Q}) for BLOCK_SIZE_Q in [16, 32, 64, 128]],
+#     key=["SEQ_LEN"],
+# )
+@triton.jit
+def _attn_bwd_preprocess(
+    O,
+    dO,
+    D,
+    SEQ_LEN,
+    BLOCK_SIZE_Q: tl.constexpr,
+    DIM: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+):
+    """Run the preprocessing step of the backward pass of the attention mechanism."""
+    block_index_q = tl.program_id(0)
+    offs_q = block_index_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+    index_batch_head_msa = tl.program_id(1)
+    offs_dim = tl.arange(0, BLOCK_DIM)
+    # Load a single block of BLOCK_SIZE_Q rows of O
+    O_block = tl.load(
+        O + index_batch_head_msa * SEQ_LEN * DIM + offs_q[:, None] * DIM + offs_dim[None, :],
+        mask=(offs_q[:, None] < SEQ_LEN) & (offs_dim[None, :] < DIM),
+        other=0.0,
+    )
+    # Load a single block of BLOCK_SIZE_Q rows of dO
+    dO_block = tl.load(
+        dO + index_batch_head_msa * SEQ_LEN * DIM + offs_q[:, None] * DIM + offs_dim[None, :],
+        mask=(offs_q[:, None] < SEQ_LEN) & (offs_dim[None, :] < DIM),
+        other=0.0,
+    ).to(tl.float32)
+    # Compute the D block
+    D_block = tl.sum(dO_block * O_block, axis=1)  # Shape: (BLOCK_SIZE_Q,)
+    # Store the D block
+    D_block_ptrs = D + index_batch_head_msa * SEQ_LEN + offs_q
+    tl.store(D_block_ptrs, D_block, mask=offs_q < SEQ_LEN)
+
+
+# @triton.autotune(
+#     [
+#         triton.Config(
+#             {"BLOCK_SIZE_Q": BLOCK_SIZE_Q, "BLOCK_SIZE_KV": BLOCK_SIZE_KV},
+#             num_stages=num_stages,
+#             num_warps=num_warps,
+#         )
+#         for BLOCK_SIZE_Q in [16, 32, 64]
+#         for BLOCK_SIZE_KV in [16, 32, 64]
+#         for num_stages in ([1, 3, 4, 7])
+#         for num_warps in [4, 8]
+#     ],
+#     key=["SEQ_LEN", "DIM"],
+#     # reset_to_zero=["d_pair_bias"],
+# )
+@triton.heuristics(
+    {
+        "EVEN_Q": lambda args: args["SEQ_LEN"] % args["BLOCK_SIZE_Q"] == 0,
+        "EVEN_KV": lambda args: args["SEQ_LEN"] % args["BLOCK_SIZE_KV"] == 0,
+        "EVEN_DIM": lambda args: args["DIM"] == args["BLOCK_DIM"],
+    }
+)
+@triton.jit
+def _attn_bwd_dq(
+    Q,
+    K,
+    V,
+    res_mask,
+    pair_bias,
+    softmax_scale,
+    dO,
+    dQ,
+    dK,
+    dV,
+    d_pair_bias,
+    M,
+    D,
+    stride_batch,
+    stride_head,
+    stride_msa,
+    stride_seq,
+    stride_pair_bias_batch,
+    stride_pair_bias_head,
+    stride_pair_bias_seq1,
+    stride_pair_bias_seq2,
+    stride_mask_batch,
+    stride_mask_msa,
+    stride_mask_seq,
+    stride_d_pair_bias_batch,
+    stride_d_pair_bias_head,
+    stride_d_pair_bias_seq1,
+    stride_d_pair_bias_seq2,
+    HEAD,
+    N_SEQ,
+    SEQ_LEN,
+    BLOCK_DIM: tl.constexpr,
+    DIM: tl.constexpr,
+    EVEN_Q: tl.constexpr,
+    EVEN_KV: tl.constexpr,
+    EVEN_DIM: tl.constexpr,
+    BLOCK_SIZE_Q: tl.constexpr,
+    BLOCK_SIZE_KV: tl.constexpr,
+):
+    """Run the backward pass of the attention mechanism."""
+    index_batch_head_msa = tl.program_id(2)
+    index_batch_head = index_batch_head_msa // N_SEQ
+    index_msa = index_batch_head_msa % N_SEQ
+    index_batch = index_batch_head // HEAD
+    index_head = index_batch_head % HEAD
+
+    offset_batch_head_msa = (
+        index_batch * stride_batch + index_head * stride_head + index_msa * stride_msa
+    ).to(tl.int64)
+    offset_batch_head_msa_seq = (index_batch_head_msa * SEQ_LEN).to(tl.int64)
+
+    # Make sure the pointers are in the right place w.r.t batch and head
+    # The reason we don't access the blocks through make_block_ptr is because we need to use the range of offsets to apply the masking
+    Q += offset_batch_head_msa
+    K += offset_batch_head_msa
+    V += offset_batch_head_msa
+    dO += offset_batch_head_msa
+    dQ += offset_batch_head_msa
+    dK += offset_batch_head_msa
+    dV += offset_batch_head_msa
+
+    # Make sure the pointers are in the right place w.r.t batch, head and sequence
+    M += offset_batch_head_msa_seq
+    D += offset_batch_head_msa_seq
+
+    # load scales
+    offs_dim = tl.arange(0, BLOCK_DIM)
+
+    index_block_kv = tl.program_id(0)
+    offs_q = index_block_kv * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+
+    dQ_block = tl.zeros([BLOCK_SIZE_Q, BLOCK_DIM], dtype=tl.float32)
+
+    if EVEN_Q & EVEN_KV:
+        M_block = tl.load(M + offs_q)
+        Di = tl.load(D + offs_q)
+        if EVEN_DIM:
+            Q_block = tl.load(Q + offs_q[:, None] * stride_seq + offs_dim[None, :])
+            dO_block = tl.load(dO + offs_q[:, None] * stride_seq + offs_dim[None, :])
+        else:
+            Q_block = tl.load(
+                Q + offs_q[:, None] * stride_seq + offs_dim[None, :],
+                mask=offs_dim[None, :] < DIM,
+                other=0.0,
+            )
+            dO_block = tl.load(
+                dO + offs_q[:, None] * stride_seq + offs_dim[None, :],
+                mask=offs_dim[None, :] < DIM,
+                other=0.0,
+            )
+    else:
+        M_block = tl.load(M + offs_q, mask=offs_q < SEQ_LEN, other=0.0)
+        Di = tl.load(D + offs_q, mask=offs_q < SEQ_LEN, other=0.0)
+        if EVEN_DIM:
+            Q_block = tl.load(
+                Q + offs_q[:, None] * stride_seq + offs_dim[None, :],
+                mask=offs_q[:, None] < SEQ_LEN,
+                other=0.0,
+            )
+            dO_block = tl.load(
+                dO + offs_q[:, None] * stride_seq + offs_dim[None, :],
+                mask=offs_q[:, None] < SEQ_LEN,
+                other=0.0,
+            )
+        else:
+            Q_block = tl.load(
+                Q + offs_q[:, None] * stride_seq + offs_dim[None, :],
+                mask=(offs_q[:, None] < SEQ_LEN) & (offs_dim[None, :] < DIM),
+                other=0.0,
+            )
+            dO_block = tl.load(
+                dO + offs_q[:, None] * stride_seq + offs_dim[None, :],
+                mask=(offs_q[:, None] < SEQ_LEN) & (offs_dim[None, :] < DIM),
+                other=0.0,
+            )
+
+    M_block = M_block[:, None]
+
+    offs_kv = tl.arange(0, BLOCK_SIZE_KV)
+    pair_bias_block_ptr = (
+        pair_bias
+        + (index_batch * stride_pair_bias_batch + index_head * stride_pair_bias_head)
+        + offs_q[:, None] * stride_pair_bias_seq1
+        + offs_kv[None, :] * stride_pair_bias_seq2
+    )
+
+    assert d_pair_bias.is_contiguous()
+    d_pair_bias_block_ptr = (
+        d_pair_bias
+        + (index_batch * stride_d_pair_bias_batch + index_head * stride_d_pair_bias_head).to(
+            tl.int64
+        )
+        + (offs_q[:, None] * stride_d_pair_bias_seq1)
+        + (offs_kv[None, :] * stride_d_pair_bias_seq2)
+    )
+
+    res_mask_block_ptr = (
+        res_mask
+        + (index_batch * stride_mask_batch + index_msa * stride_mask_msa)
+        + (offs_kv[None, :] * stride_mask_seq)
+    )
+
+    # We access the K and V as transposed blocks
+    kT_ptrs = K + offs_kv[None, :] * stride_seq + offs_dim[:, None]
+    vT_ptrs = V + offs_kv[None, :] * stride_seq + offs_dim[:, None]
+
+    Q_block = Q_block * tl.full((1,), softmax_scale, dtype=Q_block.dtype)
+
+    curr_kv = 0
+    num_steps = (SEQ_LEN + BLOCK_SIZE_KV - 1) // BLOCK_SIZE_KV
+
+    for blk_idx in range(num_steps):
+        if EVEN_Q & EVEN_KV:
+            pair_bias_block = tl.load(pair_bias_block_ptr)
+            res_mask_block = tl.load(res_mask_block_ptr).broadcast_to(
+                (BLOCK_SIZE_Q, BLOCK_SIZE_KV)
+            )
+            if EVEN_DIM:
+                K_T_block = tl.load(kT_ptrs)
+                V_T_block = tl.load(vT_ptrs)
+            else:
+                K_T_block = tl.load(kT_ptrs, mask=offs_dim[:, None] < DIM, other=0.0)
+                V_T_block = tl.load(vT_ptrs, mask=offs_dim[:, None] < DIM, other=0.0)
+        else:
+            pair_bias_block = tl.load(
+                pair_bias_block_ptr,
+                mask=(offs_q[:, None] < SEQ_LEN)
+                & ((blk_idx * BLOCK_SIZE_KV + offs_kv)[None, :] < SEQ_LEN),
+                other=0.0,
+            )
+            res_mask_block = tl.load(
+                res_mask_block_ptr,
+                mask=(blk_idx * BLOCK_SIZE_KV + offs_kv)[None, :] < SEQ_LEN,
+                other=False,
+            ).broadcast_to((BLOCK_SIZE_Q, BLOCK_SIZE_KV))
+            if EVEN_DIM:
+                K_T_block = tl.load(
+                    kT_ptrs,
+                    mask=(blk_idx * BLOCK_SIZE_KV + offs_kv)[None, :] < SEQ_LEN,
+                    other=0.0,
+                )
+                V_T_block = tl.load(
+                    vT_ptrs,
+                    mask=(blk_idx * BLOCK_SIZE_KV + offs_kv)[None, :] < SEQ_LEN,
+                    other=0.0,
+                )
+            else:
+                K_T_block = tl.load(
+                    kT_ptrs,
+                    mask=((blk_idx * BLOCK_SIZE_KV + offs_kv)[None, :] < SEQ_LEN)
+                    & (offs_dim[:, None] < DIM),
+                    other=0.0,
+                )
+                V_T_block = tl.load(
+                    vT_ptrs,
+                    mask=((blk_idx * BLOCK_SIZE_KV + offs_kv)[None, :] < SEQ_LEN)
+                    & (offs_dim[:, None] < DIM),
+                    other=0.0,
+                )
+
+        QK_block = tl.dot(Q_block, K_T_block) + pair_bias_block
+        QK_block = tl.where(res_mask_block, QK_block, get_neg_max_value(QK_block.dtype))
+        P_block = tl.math.exp(QK_block - M_block)
+
+        # Compute dP and dS.
+        dP_block = tl.dot(dO_block, V_T_block).to(tl.float32)
+        dS_block = P_block * (dP_block - Di[:, None])
+        # Update d_pair_bias atomic add with float32 precision
+        tl.atomic_add(
+            d_pair_bias_block_ptr,
+            dS_block,
+            mask=(offs_q[:, None] < SEQ_LEN)
+            & ((blk_idx * BLOCK_SIZE_KV + offs_kv)[None, :] < SEQ_LEN),
+        )
+        dS_block = dS_block.to(K_T_block.dtype)
+        # Compute dQ.
+        # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
+        dQ_block += softmax_scale * tl.dot(dS_block, tl.trans(K_T_block))
+        # Increment pointers.
+        curr_kv += BLOCK_SIZE_KV
+        kT_ptrs += BLOCK_SIZE_KV * stride_seq
+        vT_ptrs += BLOCK_SIZE_KV * stride_seq
+        pair_bias_block_ptr += BLOCK_SIZE_KV * stride_pair_bias_seq2
+        d_pair_bias_block_ptr += BLOCK_SIZE_KV * stride_d_pair_bias_seq2
+        res_mask_block_ptr += BLOCK_SIZE_KV * stride_mask_seq
+
+    dQ_block_ptrs = dQ + offs_q[:, None] * stride_seq + offs_dim[None, :]
+    if EVEN_Q & EVEN_KV:
+        if EVEN_DIM:
+            tl.store(dQ_block_ptrs, dQ_block)
+        else:
+            tl.store(dQ_block_ptrs, dQ_block, mask=offs_dim[None, :] < DIM)
+    else:
+        if EVEN_DIM:
+            tl.store(dQ_block_ptrs, dQ_block, mask=offs_q[:, None] < SEQ_LEN)
+        else:
+            tl.store(
+                dQ_block_ptrs,
+                dQ_block,
+                mask=(offs_q[:, None] < SEQ_LEN) & (offs_dim[None, :] < DIM),
+            )
+
+
+# @triton.autotune(
+#     [
+#         triton.Config(
+#             {"BLOCK_SIZE_Q": BLOCK_SIZE_Q, "BLOCK_SIZE_KV": BLOCK_SIZE_KV},
+#             num_stages=num_stages,
+#             num_warps=num_warps,
+#         )
+#         for BLOCK_SIZE_Q in [16, 32, 64]
+#         for BLOCK_SIZE_KV in [16, 32, 64]
+#         for num_stages in ([1, 3, 4, 7])
+#         for num_warps in [4, 8]
+#     ],
+#     key=["SEQ_LEN", "DIM"],
+# )
+@triton.heuristics(
+    {
+        "EVEN_Q": lambda args: args["SEQ_LEN"] % args["BLOCK_SIZE_Q"] == 0,
+        "EVEN_KV": lambda args: args["SEQ_LEN"] % args["BLOCK_SIZE_KV"] == 0,
+        "EVEN_DIM": lambda args: args["DIM"] == args["BLOCK_DIM"],
+    }
+)
+@triton.jit
+def _attn_bwd_dk_dv(
+    Q,
+    K,
+    V,
+    res_mask,
+    pair_bias,
+    softmax_scale,
+    dO,
+    dQ,
+    dK,
+    dV,
+    M,
+    D,
+    stride_batch,
+    stride_head,
+    stride_msa,
+    stride_seq,
+    stride_pair_bias_batch,
+    stride_pair_bias_head,
+    stride_pair_bias_seq1,
+    stride_pair_bias_seq2,
+    stride_mask_batch,
+    stride_mask_msa,
+    stride_mask_seq,
+    HEAD,
+    N_SEQ,
+    SEQ_LEN,
+    BLOCK_DIM: tl.constexpr,
+    DIM: tl.constexpr,
+    EVEN_Q: tl.constexpr,
+    EVEN_KV: tl.constexpr,
+    EVEN_DIM: tl.constexpr,
+    BLOCK_SIZE_Q: tl.constexpr,
+    BLOCK_SIZE_KV: tl.constexpr,
+):
+    """Run the backward pass of the attention mechanism."""
+    index_batch_head_msa = tl.program_id(2)
+    index_batch_head = index_batch_head_msa // N_SEQ
+    index_msa = index_batch_head_msa % N_SEQ
+    index_batch = index_batch_head // HEAD
+    index_head = index_batch_head % HEAD
+
+    offset_batch_head_msa = (
+        index_batch * stride_batch + index_head * stride_head + index_msa * stride_msa
+    ).to(tl.int64)
+    offset_batch_head_msa_seq = (index_batch_head_msa * SEQ_LEN).to(tl.int64)
+
+    # Make sure the pointers are in the right place w.r.t batch and head
+    Q += offset_batch_head_msa
+    K += offset_batch_head_msa
+    V += offset_batch_head_msa
+    dO += offset_batch_head_msa
+    dQ += offset_batch_head_msa
+    dK += offset_batch_head_msa
+    dV += offset_batch_head_msa
+
+    M += offset_batch_head_msa_seq
+    D += offset_batch_head_msa_seq
+
+    # load scales
+    offs_dim = tl.arange(0, BLOCK_DIM)
+
+    index_block_kv = tl.program_id(0)
+    offs_kv = index_block_kv * BLOCK_SIZE_KV + tl.arange(0, BLOCK_SIZE_KV)
+    offs_q = tl.arange(0, BLOCK_SIZE_Q)
+
+    dK_block = tl.zeros([BLOCK_SIZE_KV, BLOCK_DIM], dtype=tl.float32)
+    dV_block = tl.zeros([BLOCK_SIZE_KV, BLOCK_DIM], dtype=tl.float32)
+
+    res_mask_block_ptr = (
+        res_mask
+        + (index_batch * stride_mask_batch + index_msa * stride_mask_msa)
+        + offs_kv[None, :] * stride_mask_seq
+    )
+
+    # load K and V: they stay in SRAM throughout the inner loop.
+    if EVEN_Q & EVEN_KV:
+        res_mask_T_block = tl.trans(tl.load(res_mask_block_ptr)).broadcast_to(
+            (BLOCK_SIZE_KV, BLOCK_SIZE_Q)
+        )
+        if EVEN_DIM:
+            K_block = tl.load(
+                K + offs_kv[:, None] * stride_seq + offs_dim[None, :]
+            )  # Shape: (BLOCK_SIZE_KV, DIM)
+            V_block = tl.load(
+                V + offs_kv[:, None] * stride_seq + offs_dim[None, :]
+            )  # Shape: (BLOCK_SIZE_KV, DIM)
+        else:
+            K_block = tl.load(
+                K + offs_kv[:, None] * stride_seq + offs_dim[None, :],
+                mask=offs_dim[None, :] < DIM,
+                other=0.0,
+            )  # Shape: (BLOCK_SIZE_KV, DIM)
+            V_block = tl.load(
+                V + offs_kv[:, None] * stride_seq + offs_dim[None, :],
+                mask=offs_dim[None, :] < DIM,
+                other=0.0,
+            )  # Shape: (BLOCK_SIZE_KV, DIM)
+    else:
+        res_mask_T_block = tl.trans(
+            tl.load(res_mask_block_ptr, mask=offs_kv[None, :] < SEQ_LEN, other=False)
+        ).broadcast_to((BLOCK_SIZE_KV, BLOCK_SIZE_Q))
+        if EVEN_DIM:
+            K_block = tl.load(
+                K + offs_kv[:, None] * stride_seq + offs_dim[None, :],
+                mask=offs_kv[:, None] < SEQ_LEN,
+                other=0.0,
+            )
+            V_block = tl.load(
+                V + offs_kv[:, None] * stride_seq + offs_dim[None, :],
+                mask=offs_kv[:, None] < SEQ_LEN,
+                other=0.0,
+            )
+        else:
+            K_block = tl.load(
+                K + offs_kv[:, None] * stride_seq + offs_dim[None, :],
+                mask=(offs_kv[:, None] < SEQ_LEN) & (offs_dim[None, :] < DIM),
+                other=0.0,
+            )
+            V_block = tl.load(
+                V + offs_kv[:, None] * stride_seq + offs_dim[None, :],
+                mask=(offs_kv[:, None] < SEQ_LEN) & (offs_dim[None, :] < DIM),
+                other=0.0,
+            )
+
+    # pointer to transposed pair bias
+    pair_bias_T_block_ptr = (
+        pair_bias
+        + (
+            index_batch.to(tl.int64) * stride_pair_bias_batch
+            + index_head.to(tl.int64) * stride_pair_bias_head
+        )
+        + offs_q[None, :] * stride_pair_bias_seq1
+        + offs_kv[:, None] * stride_pair_bias_seq2
+    )
+
+    # We access the Q as a transposed array, so that's why we treat offs_q as a column vector and offs_dim as a row vector
+    # This is equivalent to doing:
+    # q_ptrs = Q + offs_q[:, None] * stride_seq + offs_dim[None, :] * stride_dim
+    # qT_ptrs = tl.trans(q_ptrs)
+    # We point to the first BLOCK_SIZE_Q rows of Q for both the qT and dO pointers, inside the for loop we will move forward by BLOCK_SIZE_Q rows at each iteration.
+    qT_ptrs = Q + offs_q[None, :] * stride_seq + offs_dim[:, None]
+    dO_ptrs = dO + offs_q[:, None] * stride_seq + offs_dim[None, :]
+
+    K_block = K_block * tl.full((1,), softmax_scale, dtype=K_block.dtype)
+
+    curr_q = 0
+    num_steps = (SEQ_LEN + BLOCK_SIZE_Q - 1) // BLOCK_SIZE_Q
+
+    for _ in range(num_steps):
+        # Load the logsumexp values for the queries in the current block
+        offs_q = curr_q + tl.arange(0, BLOCK_SIZE_Q)
+
+        if EVEN_Q & EVEN_KV:
+            m = tl.load(M + offs_q)
+            pair_bias_T_block = tl.load(pair_bias_T_block_ptr)
+            Di = tl.load(D + offs_q)
+            if EVEN_DIM:
+                qT_block = tl.load(qT_ptrs)
+                dO_block = tl.load(dO_ptrs)
+            else:
+                qT_block = tl.load(qT_ptrs, mask=offs_dim[:, None] < DIM, other=0.0)
+                dO_block = tl.load(dO_ptrs, mask=offs_dim[None, :] < DIM, other=0.0)
+        else:
+            m = tl.load(M + offs_q, mask=offs_q < SEQ_LEN, other=0.0)
+            pair_bias_T_block = tl.load(
+                pair_bias_T_block_ptr,
+                mask=(offs_q[None, :] < SEQ_LEN) & (offs_kv[:, None] < SEQ_LEN),
+                other=0.0,
+            )
+            Di = tl.load(D + offs_q, mask=offs_q < SEQ_LEN, other=0.0)
+            if EVEN_DIM:
+                qT_block = tl.load(qT_ptrs, mask=offs_q[None, :] < SEQ_LEN, other=0.0)
+                dO_block = tl.load(dO_ptrs, mask=offs_q[:, None] < SEQ_LEN, other=0.0)
+            else:
+                qT_block = tl.load(
+                    qT_ptrs,
+                    mask=(offs_q[None, :] < SEQ_LEN) & (offs_dim[:, None] < DIM),
+                    other=0.0,
+                )
+                dO_block = tl.load(
+                    dO_ptrs,
+                    mask=(offs_q[:, None] < SEQ_LEN) & (offs_dim[None, :] < DIM),
+                    other=0.0,
+                )
+
+        # This gives us (QK^T)^T = (K^T)^T(Q^T) = K(Q^T) = P^T
+        QK_T_block = tl.dot(K_block, qT_block) + pair_bias_T_block
+
+        # apply mask:
+        QK_T_block = tl.where(res_mask_T_block, QK_T_block, get_neg_max_value(QK_T_block.dtype))
+
+        # We apply the softmax by using the logsumexp trick
+        P_T_block = tl.math.exp(QK_T_block - m[None, :])
+
+        # According to the formula: dV_new = dV_old + P^T x dO, where x is the matrix multiplication
+        dV_block += tl.dot(P_T_block.to(K_block.dtype), dO_block)
+
+        # dP = dO x V^T, so dP^T = V x dO^T
+        # Where x is the matrix multiplication
+        dpT_block = tl.dot(V_block, tl.trans(dO_block)).to(tl.float32)
+
+        # We know that dS = P * (dP - Delta), so dS^T = P^T * (dP^T - Delta^T)
+        dS_T_block = P_T_block * (dpT_block - Di[None, :])
+        dS_T_block = dS_T_block.to(K_block.dtype)
+
+        # According to the formula on the paper: dK_new = dK_old + dS^T x Q
+        dK_block += softmax_scale * tl.dot(dS_T_block, tl.trans(qT_block))
+        # Increment pointers.
+        curr_q += BLOCK_SIZE_Q
+        qT_ptrs += BLOCK_SIZE_Q * stride_seq
+        dO_ptrs += BLOCK_SIZE_Q * stride_seq
+        pair_bias_T_block_ptr += BLOCK_SIZE_Q * stride_pair_bias_seq1
+
+    # Write back dV & dK
+    dV_block_ptrs = dV + offs_kv[:, None] * stride_seq + offs_dim[None, :]
+    dK_block_ptrs = dK + offs_kv[:, None] * stride_seq + offs_dim[None, :]
+
+    if EVEN_Q & EVEN_KV:
+        if EVEN_DIM:
+            tl.store(dV_block_ptrs, dV_block)
+            tl.store(dK_block_ptrs, dK_block)
+        else:
+            tl.store(dV_block_ptrs, dV_block, mask=offs_dim[None, :] < DIM)
+            tl.store(dK_block_ptrs, dK_block, mask=offs_dim[None, :] < DIM)
+    else:
+        if EVEN_DIM:
+            tl.store(dV_block_ptrs, dV_block, mask=offs_kv[:, None] < SEQ_LEN)
+            tl.store(dK_block_ptrs, dK_block, mask=offs_kv[:, None] < SEQ_LEN)
+        else:
+            tl.store(
+                dV_block_ptrs,
+                dV_block,
+                mask=(offs_kv[:, None] < SEQ_LEN) & (offs_dim[None, :] < DIM),
+            )
+            tl.store(
+                dK_block_ptrs,
+                dK_block,
+                mask=(offs_kv[:, None] < SEQ_LEN) & (offs_dim[None, :] < DIM),
+            )
+
+
+class EvoformerAttention(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, Q, K, V, res_mask, pair_bias):
+        """Run the forward pass of the attention mechanism."""
+        # Q, K, V: [Batch, N_seq, N_res, Head, Dim]
+        # res_mask: [Batch, N_seq, 1, 1, N_res]
+        # pair_bias: [Batch, 1, Head, N_res, N_res]
+        # mem_usage = SynchronizedWallClockTimer.memory_usage()
+        # print("Memory usage after init: ", mem_usage)
+
+        DIM_Q, DIM_K, DIM_V = Q.shape[-1], K.shape[-1], V.shape[-1]
+        assert DIM_Q == DIM_K and DIM_K == DIM_V
+
+        BATCH_SIZE, N_SEQ, SEQ_LEN, HEAD, DIM = Q.shape
+        softmax_scale = DIM**-0.5
+        BLOCK_DIM = max(triton.next_power_of_2(DIM), 16)
+
+        Q = Q.reshape((BATCH_SIZE, HEAD, N_SEQ, SEQ_LEN, DIM))
+        K = K.reshape((BATCH_SIZE, HEAD, N_SEQ, SEQ_LEN, DIM))
+        V = V.reshape((BATCH_SIZE, HEAD, N_SEQ, SEQ_LEN, DIM))
+        res_mask = res_mask.reshape((BATCH_SIZE, 1, N_SEQ, SEQ_LEN, 1))
+        pair_bias = pair_bias.reshape((BATCH_SIZE, HEAD, 1, SEQ_LEN, SEQ_LEN))
+
+        O = torch.empty_like(Q)  # noqa: E741
+
+        # Tuning for AMD target
+        extra_kern_args = {}
+        if is_hip():
+            waves_per_eu = 3 if DIM <= 64 else 2
+            extra_kern_args = {"waves_per_eu": waves_per_eu, "allow_flush_denorm": True}
+
+        grid = lambda args: (  # noqa: E731
+            triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]),
+            BATCH_SIZE * HEAD * N_SEQ,
+            1,
+        )
+
+        # M is the logsumexp for the backward pass, one for each query
+        M = torch.empty((BATCH_SIZE, HEAD, N_SEQ, SEQ_LEN), device=Q.device, dtype=torch.float32)
+
+        # mem_usage = SynchronizedWallClockTimer.memory_usage()
+        # print("Memory usage after init O and M: ", mem_usage)
+
+        _attn_fwd[grid](
+            Q=Q,
+            K=K,
+            V=V,
+            res_mask=res_mask,
+            pair_bias=pair_bias,
+            softmax_scale=softmax_scale,
+            M=M,
+            O=O,
+            stride_Q_batch=Q.stride(0),
+            stride_Q_head=Q.stride(1),
+            stride_Q_msa=Q.stride(2),
+            stride_Q_seq=Q.stride(3),
+            stride_Q_dim=Q.stride(4),
+            stride_K_batch=K.stride(0),
+            stride_K_head=K.stride(1),
+            stride_K_msa=K.stride(2),
+            stride_K_seq=K.stride(3),
+            stride_K_dim=K.stride(4),
+            stride_V_batch=V.stride(0),
+            stride_V_head=V.stride(1),
+            stride_V_msa=V.stride(2),
+            stride_V_seq=V.stride(3),
+            stride_V_dim=V.stride(4),
+            stride_O_batch=O.stride(0),
+            stride_O_head=O.stride(1),
+            stride_O_msa=O.stride(2),
+            stride_O_seq=O.stride(3),
+            stride_O_dim=O.stride(4),
+            stride_pair_bias_batch=pair_bias.stride(0),
+            stride_pair_bias_head=pair_bias.stride(1),
+            stride_pair_bias_seq1=pair_bias.stride(3),
+            stride_pair_bias_seq2=pair_bias.stride(4),
+            stride_mask_batch=res_mask.stride(0),
+            stride_mask_msa=res_mask.stride(2),
+            stride_mask_seq=res_mask.stride(3),
+            BATCH_SIZE=BATCH_SIZE,
+            HEAD=HEAD,
+            N_SEQ=N_SEQ,
+            SEQ_LEN=SEQ_LEN,
+            DIM=DIM,
+            BLOCK_DIM=BLOCK_DIM,
+            # NOTE: The following values were autotuned for AMD Instinct MI250X GPUs
+            BLOCK_SIZE_Q=64,
+            BLOCK_SIZE_KV=16,
+            num_warps=4,
+            num_stages=1,
+            **extra_kern_args,
+        )
+
+        # mem_usage = SynchronizedWallClockTimer.memory_usage()
+        # print("Memory usage after fwd pass: ", mem_usage)
+
+        ctx.save_for_backward(Q, K, V, res_mask, pair_bias, O, M)
+        ctx.grid = grid
+        ctx.softmax_scale = softmax_scale
+        ctx.DIM = DIM
+
+        # change back to original shape
+        O = O.reshape((BATCH_SIZE, N_SEQ, SEQ_LEN, HEAD, DIM))  # noqa: E741
+
+        return O
+
+    @staticmethod
+    def backward(ctx, dO):
+        """Run the backward pass of the attention mechanism."""
+        Q, K, V, res_mask, pair_bias, O, M = ctx.saved_tensors
+
+        BATCH_SIZE, N_SEQ, SEQ_LEN, HEAD, DIM = dO.shape
+        dO = dO.reshape((BATCH_SIZE, HEAD, N_SEQ, SEQ_LEN, DIM))
+
+        assert dO.is_contiguous()
+        assert Q.stride() == K.stride() == V.stride() == O.stride() == dO.stride()
+        dQ = torch.empty_like(Q)
+        dK = torch.empty_like(K)
+        dV = torch.empty_like(V)
+        d_pair_bias = torch.empty(
+            (BATCH_SIZE, HEAD, SEQ_LEN, SEQ_LEN),
+            device=pair_bias.device,
+            dtype=torch.float32,
+        ).zero_()
+
+        BLOCK_DIM = max(triton.next_power_of_2(DIM), 16)
+
+        D = torch.empty_like(M)  # Shape: (BATCH_SIZE, HEAD, N_SEQ, SEQ_LEN)
+
+        preprocess_grid = lambda args: (  # noqa: E731
+            triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]),
+            BATCH_SIZE * HEAD * N_SEQ,
+        )
+        # Compute all the elements Di
+        _attn_bwd_preprocess[preprocess_grid](
+            O=O,
+            dO=dO,
+            D=D,
+            SEQ_LEN=SEQ_LEN,
+            DIM=DIM,
+            BLOCK_DIM=BLOCK_DIM,
+            # NOTE: The following values were autotuned for AMD Instinct MI250X GPUs
+            BLOCK_SIZE_Q=16,
+            num_warps=4,
+            num_stages=2,
+        )
+
+        bwd_dk_dv_grid = lambda args: (  # noqa: E731
+            triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_KV"]),
+            1,
+            BATCH_SIZE * HEAD * N_SEQ,
+        )
+
+        # Fix KV and iterate through all the Q blocks
+        _attn_bwd_dk_dv[bwd_dk_dv_grid](
+            Q=Q,
+            K=K,
+            V=V,
+            res_mask=res_mask,
+            pair_bias=pair_bias,
+            softmax_scale=ctx.softmax_scale,
+            dO=dO,
+            dQ=dQ,
+            dK=dK,
+            dV=dV,
+            M=M,
+            D=D,
+            stride_batch=Q.stride(0),
+            stride_head=Q.stride(1),
+            stride_msa=Q.stride(2),
+            stride_seq=Q.stride(3),
+            stride_pair_bias_batch=pair_bias.stride(0),
+            stride_pair_bias_head=pair_bias.stride(1),
+            stride_pair_bias_seq1=pair_bias.stride(3),
+            stride_pair_bias_seq2=pair_bias.stride(4),
+            stride_mask_batch=res_mask.stride(0),
+            stride_mask_msa=res_mask.stride(2),
+            stride_mask_seq=res_mask.stride(3),
+            HEAD=HEAD,
+            N_SEQ=N_SEQ,
+            SEQ_LEN=SEQ_LEN,
+            BLOCK_DIM=BLOCK_DIM,
+            DIM=ctx.DIM,
+            # NOTE: The following values were autotuned for AMD Instinct MI250X GPUs
+            BLOCK_SIZE_Q=64,
+            BLOCK_SIZE_KV=64,
+            num_warps=4,
+            num_stages=1,
+        )
+
+        bwd_dq_grid = lambda args: (  # noqa: E731
+            triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]),
+            1,
+            BATCH_SIZE * HEAD * N_SEQ,
+        )
+
+        # Fix Q and iterate through all the KV block
+        _attn_bwd_dq[bwd_dq_grid](
+            Q=Q,
+            K=K,
+            V=V,
+            res_mask=res_mask,
+            pair_bias=pair_bias,
+            softmax_scale=ctx.softmax_scale,
+            dO=dO,
+            dQ=dQ,
+            dK=dK,
+            dV=dV,
+            d_pair_bias=d_pair_bias,
+            M=M,
+            D=D,
+            stride_batch=Q.stride(0),
+            stride_head=Q.stride(1),
+            stride_msa=Q.stride(2),
+            stride_seq=Q.stride(3),
+            stride_pair_bias_batch=pair_bias.stride(0),
+            stride_pair_bias_head=pair_bias.stride(1),
+            stride_pair_bias_seq1=pair_bias.stride(3),
+            stride_pair_bias_seq2=pair_bias.stride(4),
+            stride_mask_batch=res_mask.stride(0),
+            stride_mask_msa=res_mask.stride(2),
+            stride_mask_seq=res_mask.stride(3),
+            stride_d_pair_bias_batch=d_pair_bias.stride(0),
+            stride_d_pair_bias_head=d_pair_bias.stride(1),
+            stride_d_pair_bias_seq1=d_pair_bias.stride(2),
+            stride_d_pair_bias_seq2=d_pair_bias.stride(3),
+            HEAD=HEAD,
+            N_SEQ=N_SEQ,
+            SEQ_LEN=SEQ_LEN,
+            BLOCK_DIM=BLOCK_DIM,
+            DIM=ctx.DIM,
+            # NOTE: The following values were autotuned for AMD Instinct MI250X GPUs
+            BLOCK_SIZE_Q=16,
+            BLOCK_SIZE_KV=16,
+            num_warps=4,
+            num_stages=1,
+        )
+
+        # change shape to original
+        dQ = dQ.reshape((BATCH_SIZE, N_SEQ, SEQ_LEN, HEAD, DIM))
+        dK = dK.reshape((BATCH_SIZE, N_SEQ, SEQ_LEN, HEAD, DIM))
+        dV = dV.reshape((BATCH_SIZE, N_SEQ, SEQ_LEN, HEAD, DIM))
+        d_pair_bias = d_pair_bias.reshape((BATCH_SIZE, 1, HEAD, SEQ_LEN, SEQ_LEN)).to(dO.dtype)
+
+        return dQ, dK, dV, None, d_pair_bias
+
+
+TritonEvoformer = EvoformerAttention.apply

@@ -42,6 +42,7 @@ from openfold.utils.tensor_utils import (
     flatten_final_dims,
 )
 
+from openfold.utils.kernel.triton.evoformer import TritonEvoformer
 
 DEFAULT_LMA_Q_CHUNK_SIZE = 1024
 DEFAULT_LMA_KV_CHUNK_SIZE = 4096
@@ -452,6 +453,7 @@ class Attention(nn.Module):
         biases: Optional[List[torch.Tensor]] = None,
         use_memory_efficient_kernel: bool = False,
         use_deepspeed_evo_attention: bool = False,
+        use_triton_evo_attention: bool = False, 
         use_lma: bool = False,
         lma_q_chunk_size: int = DEFAULT_LMA_Q_CHUNK_SIZE,
         lma_kv_chunk_size: int = DEFAULT_LMA_KV_CHUNK_SIZE,
@@ -529,6 +531,13 @@ class Attention(nn.Module):
                     "provide up to two bias terms"
                 )
             o = _deepspeed_evo_attn(q, k, v, biases)
+        elif use_triton_evo_attention:
+            if len(biases) > 2:
+                raise ValueError(
+                    "If use_triton_evo_attention is True, you may only "
+                    "provide up to two bias terms"
+                )
+            o = _triton_evo_attn(q, k, v, biases)
         elif use_lma:
             biases = [
                 b.expand(b.shape[:-2] + (q_x.shape[-2],) + (kv_x.shape[-2],)) 
@@ -701,6 +710,64 @@ def _deepspeed_evo_attn(
     o = o.reshape(orig_shape)
     return o
 
+def _triton_evo_attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    biases: List[torch.Tensor],
+):
+    """""
+    Compute attention using the DeepSpeed DS4Sci_EvoformerAttention kernel.
+
+    Args:
+        q:
+            [*, H, Q, C_hidden] query data
+        k:
+            [*, H, K, C_hidden] key data
+        v:
+            [*, H, V, C_hidden] value data
+        biases:
+            List of biases that broadcast to [*, H, Q, K]
+    """
+
+    def reshape_dims(x):
+        no_batch_dims = len(x.shape[:-3])
+        if no_batch_dims < 2:
+            return x.reshape(*((1,) * (2 - no_batch_dims) + x.shape))
+        if no_batch_dims > 2:
+            return x.reshape(*((x.shape[0], -1) + x.shape[-3:]))
+        return x
+
+    # [*, Q/K, H, C_hidden]
+    q = q.transpose(-2, -3)
+    k = k.transpose(-2, -3)
+    v = v.transpose(-2, -3)
+
+    # Reshape tensors to match expected input shape [B, N, Q/K, H, C_hidden]
+    # for DS4Sci_EvoformerAttention() by adding or flattening batch dims as needed.
+    orig_shape = q.shape
+    if len(orig_shape[:-3]) != 2:
+        q = reshape_dims(q)
+        k = reshape_dims(k)
+        v = reshape_dims(v)
+        biases = [reshape_dims(b) for b in biases]
+
+    # DeepSpeed attn. kernel requires inputs to be type bf16 or fp16
+    # Cast to bf16 so kernel can be used during inference
+    orig_dtype = q.dtype
+    if orig_dtype not in [torch.bfloat16, torch.float16]:
+        o = TritonEvoformer(q.to(dtype=torch.bfloat16),
+                                      k.to(dtype=torch.bfloat16),
+                                      v.to(dtype=torch.bfloat16),
+                                      biases[0].to(dtype=torch.bfloat16),
+                                      biases[1].to(dtype=torch.bfloat16))
+
+        o = o.to(dtype=orig_dtype)
+    else:
+        o = TritonEvoformer(q, k, v, biases[0], biases[1])
+
+    o = o.reshape(orig_shape)
+    return o
 
 def _lma(
     q: torch.Tensor, 
