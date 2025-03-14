@@ -520,12 +520,19 @@ class Attention(nn.Module):
             o = attention_core(q, k, v, *((biases + [None] * 2)[:2]))
             o = o.transpose(-2, -3)
         elif use_deepspeed_evo_attention:
+            ### VS: vastly easier to just hardcode a swap here, than adding support for both 
+            # if len(biases) > 2:
+            #     raise ValueError(
+            #         "If use_deepspeed_evo_attention is True, you may only "
+            #         "provide up to two bias terms"
+            #     )
+            # o = _deepspeed_evo_attn(q, k, v, biases)
             if len(biases) > 2:
                 raise ValueError(
-                    "If use_deepspeed_evo_attention is True, you may only "
+                    "If use_triton_evo_attention is True, you may only "
                     "provide up to two bias terms"
                 )
-            o = _deepspeed_evo_attn(q, k, v, biases)
+            o = _triton_evo_attn(q, k, v, biases)
         elif use_triton_evo_attention:
             if len(biases) > 2:
                 raise ValueError(
@@ -748,6 +755,12 @@ def _triton_evo_attn(
         v = reshape_dims(v)
         biases = [reshape_dims(b) for b in biases]
 
+    ## MSAColAttn has no bias so spoof one
+    if len(biases) == 1:
+        Batch, N_seq, N_res, Head, Dim = q.shape
+        pair_bias = torch.zeros((Batch, 1, Head, N_res, N_res), device=q.device, dtype=q.dtype)
+        biases.append(pair_bias)
+    
     # DeepSpeed attn. kernel requires inputs to be type bf16 or fp16
     # Cast to bf16 so kernel can be used during inference
     orig_dtype = q.dtype
