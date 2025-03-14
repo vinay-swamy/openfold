@@ -81,6 +81,7 @@ class TestTritonEvoKernel(unittest.TestCase):
         elif use_triton_kernel:
             err = torch.max(torch.abs(triton_out - real_out))
         
+        print(f"use_deepspeed_kernel={use_deepspeed_kernel}, use_triton_kernel={use_triton_kernel} . fwd err: {err}")
         self.assertTrue(err < eps, f"Error: {err}")
 
     def test_triton_kernel_vs_vanilla_attention_forward(self):
