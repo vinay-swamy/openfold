@@ -521,18 +521,18 @@ class Attention(nn.Module):
             o = o.transpose(-2, -3)
         elif use_deepspeed_evo_attention:
             ### VS: vastly easier to just hardcode a swap here, than adding support for both 
-            # if len(biases) > 2:
-            #     raise ValueError(
-            #         "If use_deepspeed_evo_attention is True, you may only "
-            #         "provide up to two bias terms"
-            #     )
-            # o = _deepspeed_evo_attn(q, k, v, biases)
             if len(biases) > 2:
                 raise ValueError(
-                    "If use_triton_evo_attention is True, you may only "
+                    "If use_deepspeed_evo_attention is True, you may only "
                     "provide up to two bias terms"
                 )
-            o = _triton_evo_attn(q, k, v, biases)
+            o = _deepspeed_evo_attn(q, k, v, biases)
+            # if len(biases) > 2:
+            #     raise ValueError(
+            #         "If use_triton_evo_attention is True, you may only "
+            #         "provide up to two bias terms"
+            #     )
+            # o = _triton_evo_attn(q, k, v, biases)
         elif use_triton_evo_attention:
             if len(biases) > 2:
                 raise ValueError(
